@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  # Stop the old database pod before starting another on the same volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-relay-postgres
+  template:
+    metadata:
+      labels:
+        app: agent-relay-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-bookworm
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: agent-relay-database
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-relay-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
