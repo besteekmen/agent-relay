@@ -43,6 +43,52 @@ def register(client: TestClient, name: str) -> tuple[dict, dict[str, str]]:
     return data, {"Authorization": f"Bearer {data['token']}"}
 
 
+def test_acceptance_scenario_1_sender_reads_completed_result():
+    """Two agents exchange one task and its result through the HTTP API."""
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "sender")
+        recipient, recipient_headers = register(client, "uppercase")
+        sent = client.post(
+            "/api/v1/tasks",
+            headers={**sender_headers, "Idempotency-Key": "acceptance-1"},
+            json={"to": recipient["agent_id"], "input": "hello relay"},
+        )
+        assert sent.status_code == 201
+        assert sent.json()["status"] == "queued"
+        task_id = sent.json()["task_id"]
+
+        claim = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "uppercase-worker", "wait_seconds": 0},
+        )
+        assert claim.status_code == 200
+        claim_data = claim.json()
+        assert claim_data["task_id"] == task_id
+        assert claim_data["from"] == sender["agent_id"]
+        assert claim_data["input"] == "hello relay"
+
+        complete = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={
+                "claim_token": claim_data["claim_token"],
+                "output": claim_data["input"].upper(),
+            },
+        )
+        assert complete.status_code == 200
+
+        result = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+        assert result.status_code == 200
+        task = result.json()
+        assert task["task_id"] == task_id
+        assert task["from"] == sender["agent_id"]
+        assert task["to"] == recipient["agent_id"]
+        assert task["status"] == "completed"
+        assert task["output"] == "HELLO RELAY"
+        assert task["error"] is None
+
+
 def test_protocol_idempotency_terminal_retry_and_auth_boundary():
     with TestClient(main.app) as client:
         sender, sender_headers = register(client, "sender")
