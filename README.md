@@ -1,4 +1,4 @@
-# Agent Relay (SQLite starter)
+# Agent Relay (SQLite and PostgreSQL)
 
 Agent Relay is a small FastAPI service for registering agents, delivering one
 task at a time, and recording results. The local starter is self-contained:
@@ -72,8 +72,10 @@ uv run python main.py worker --agent-id agent_123 --token agt_… --worker-id la
 operations; routes and request models are kept in `main.py` and `schemas.py`.
 SQLite does not provide PostgreSQL's `FOR UPDATE SKIP LOCKED`, so the starter
 serializes writer transactions to make concurrent claims safe across processes.
-Students can port this storage seam to PostgreSQL later without changing the
-HTTP protocol or lifecycle in `SPEC.md`.
+PostgreSQL uses normal transactions and `FOR UPDATE SKIP LOCKED` for claims.
+Heartbeat, completion, and recovery lock the task before inspecting its attempt;
+sender row locks serialize idempotent submissions. SQLite remains the default
+for local development. Both backends use the HTTP protocol in `SPEC.md`.
 
 Claims are at-least-once and leased for 60 seconds by default. Heartbeats extend
 an active lease. A completion or failure must include the recipient's bearer
@@ -97,6 +99,45 @@ recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
 the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
 running tests against another database.
 
-This starter intentionally does not include Docker, Kubernetes, CI, external
-brokers, an LLM, or a PostgreSQL implementation. Those are deployment and
-student-port concerns rather than part of the local relay protocol.
+## PostgreSQL with Docker Compose
+
+Stop any existing server or standalone container publishing port 8000 first
+(for example, `docker stop agent-relay-local`). Then start both services:
+
+```bash
+docker compose up --build
+```
+
+Open <http://localhost:8000/>. Compose waits for PostgreSQL's health check before
+starting the API, whose health check calls `/ready`. The API creates missing
+tables and connects using
+`postgresql+psycopg://relay:relay-local@postgres:5432/agent_relay`.
+`postgres` is the database service's hostname on the Compose network; database
+port 5432 does not need to be published to the host. These credentials are for
+local development.
+
+PostgreSQL data lives in the named `postgres_data` volume and survives container
+recreation and `docker compose down`. `docker compose down -v` deletes that data.
+Existing SQLite data is not automatically migrated.
+
+In another terminal, after the API is ready, run the existing acceptance test
+against the running stack:
+
+```bash
+RELAY_TEST_BASE_URL=http://localhost:8000 uv run --frozen pytest -q \
+  test_agent_relay.py::test_acceptance_scenario_1_sender_reads_completed_result
+```
+
+Live mode uses HTTP requests without importing the local application or resetting
+database tables. It registers fresh agents and leaves its completed task available
+in the database. Other tests that require local storage are skipped in live mode.
+If WSL cannot reach Docker Desktop through localhost, run the test from an
+environment that can reach the published port and set `RELAY_TEST_BASE_URL` to
+that address.
+
+Without `RELAY_TEST_BASE_URL`, the acceptance test still uses `TestClient` and
+the isolated database fixture. Run the full local suite with:
+
+```bash
+uv run --frozen pytest -q
+```

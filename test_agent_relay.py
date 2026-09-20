@@ -1,10 +1,4 @@
-"""Protocol tests for the SQLite starter.
-
-These tests intentionally exercise storage calls from multiple threads: that
-is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
-not from a Python lock.
-"""
+"""Local protocol tests and an optional live-API acceptance scenario."""
 
 from __future__ import annotations
 
@@ -13,21 +7,30 @@ import os
 # Default to a scratch DB so `pytest` never resets the dev server's
 # `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
 # (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+LIVE_BASE_URL = os.getenv("RELAY_TEST_BASE_URL", "").strip()
+if not LIVE_BASE_URL:
+    os.environ.setdefault("RELAY_DATABASE_URL", os.getenv("DATABASE_URL") or "sqlite:////tmp/agent-relay-test.db")
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-import main
-from database import Attempt, Base, Task, as_db_time, db_session, engine, utcnow
-from storage import claim_one
+if not LIVE_BASE_URL:
+    import main
+    from database import Attempt, Base, Task, as_db_time, db_session, engine, utcnow
+    from storage import claim_one, create_task
 
 
 @pytest.fixture(autouse=True)
-def empty_database():
+def empty_database(request):
+    if LIVE_BASE_URL:
+        if "api_client" not in request.fixturenames:
+            pytest.skip("This test requires an isolated local database")
+        yield
+        return
     # Resets whatever DB RELAY_DATABASE_URL points at. Defaults to the
     # scratch /tmp file above; never run against a DB with data you need.
     Base.metadata.drop_all(engine)
@@ -36,57 +39,69 @@ def empty_database():
     Base.metadata.drop_all(engine)
 
 
-def register(client: TestClient, name: str) -> tuple[dict, dict[str, str]]:
+@pytest.fixture
+def api_client():
+    if LIVE_BASE_URL:
+        with httpx.Client(base_url=LIVE_BASE_URL.rstrip("/"), timeout=40) as client:
+            ready = client.get("/ready")
+            assert ready.status_code == 200, ready.text
+            yield client
+    else:
+        with TestClient(main.app) as client:
+            yield client
+
+
+def register(client: TestClient | httpx.Client, name: str) -> tuple[dict, dict[str, str]]:
     response = client.post("/api/v1/agents", json={"name": name})
     assert response.status_code == 201
     data = response.json()
     return data, {"Authorization": f"Bearer {data['token']}"}
 
 
-def test_acceptance_scenario_1_sender_reads_completed_result():
+def test_acceptance_scenario_1_sender_reads_completed_result(api_client):
     """Two agents exchange one task and its result through the HTTP API."""
-    with TestClient(main.app) as client:
-        sender, sender_headers = register(client, "sender")
-        recipient, recipient_headers = register(client, "uppercase")
-        sent = client.post(
-            "/api/v1/tasks",
-            headers={**sender_headers, "Idempotency-Key": "acceptance-1"},
-            json={"to": recipient["agent_id"], "input": "hello relay"},
-        )
-        assert sent.status_code == 201
-        assert sent.json()["status"] == "queued"
-        task_id = sent.json()["task_id"]
+    client = api_client
+    sender, sender_headers = register(client, "sender")
+    recipient, recipient_headers = register(client, "uppercase")
+    sent = client.post(
+        "/api/v1/tasks",
+        headers={**sender_headers, "Idempotency-Key": "acceptance-1"},
+        json={"to": recipient["agent_id"], "input": "hello relay"},
+    )
+    assert sent.status_code == 201
+    assert sent.json()["status"] == "queued"
+    task_id = sent.json()["task_id"]
 
-        claim = client.post(
-            "/api/v1/tasks/claim",
-            headers=recipient_headers,
-            json={"worker_id": "uppercase-worker", "wait_seconds": 0},
-        )
-        assert claim.status_code == 200
-        claim_data = claim.json()
-        assert claim_data["task_id"] == task_id
-        assert claim_data["from"] == sender["agent_id"]
-        assert claim_data["input"] == "hello relay"
+    claim = client.post(
+        "/api/v1/tasks/claim",
+        headers=recipient_headers,
+        json={"worker_id": "uppercase-worker", "wait_seconds": 0},
+    )
+    assert claim.status_code == 200
+    claim_data = claim.json()
+    assert claim_data["task_id"] == task_id
+    assert claim_data["from"] == sender["agent_id"]
+    assert claim_data["input"] == "hello relay"
 
-        complete = client.post(
-            f"/api/v1/tasks/{task_id}/complete",
-            headers=recipient_headers,
-            json={
-                "claim_token": claim_data["claim_token"],
-                "output": claim_data["input"].upper(),
-            },
-        )
-        assert complete.status_code == 200
+    complete = client.post(
+        f"/api/v1/tasks/{task_id}/complete",
+        headers=recipient_headers,
+        json={
+            "claim_token": claim_data["claim_token"],
+            "output": claim_data["input"].upper(),
+        },
+    )
+    assert complete.status_code == 200
 
-        result = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
-        assert result.status_code == 200
-        task = result.json()
-        assert task["task_id"] == task_id
-        assert task["from"] == sender["agent_id"]
-        assert task["to"] == recipient["agent_id"]
-        assert task["status"] == "completed"
-        assert task["output"] == "HELLO RELAY"
-        assert task["error"] is None
+    result = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+    assert result.status_code == 200
+    task = result.json()
+    assert task["task_id"] == task_id
+    assert task["from"] == sender["agent_id"]
+    assert task["to"] == recipient["agent_id"]
+    assert task["status"] == "completed"
+    assert task["output"] == "HELLO RELAY"
+    assert task["error"] is None
 
 
 def test_protocol_idempotency_terminal_retry_and_auth_boundary():
@@ -144,7 +159,21 @@ def test_protocol_idempotency_terminal_retry_and_auth_boundary():
         assert "claim_token" not in attempts["items"][0]
 
 
-def test_sqlite_atomic_claims_distribute_without_overlap():
+def test_concurrent_idempotent_submissions_create_one_task():
+    with TestClient(main.app) as client:
+        sender, _sender_headers = register(client, "sender")
+        recipient, _recipient_headers = register(client, "recipient")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(
+                lambda _: create_task(sender["agent_id"], recipient["agent_id"], "hello", "shared-key"),
+                range(8),
+            ))
+        assert len({result["task_id"] for result in results}) == 1
+        with db_session() as db:
+            assert db.query(Task).count() == 1
+
+
+def test_atomic_claims_distribute_without_overlap():
     with TestClient(main.app) as client:
         _sender, sender_headers = register(client, "sender")
         recipient, _recipient_headers = register(client, "recipient")

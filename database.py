@@ -1,10 +1,4 @@
-"""SQLite database setup and durable Agent Relay models.
-
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
-"""
+"""SQLite/PostgreSQL setup, durable models, and coordinated lease recovery."""
 
 from __future__ import annotations
 
@@ -177,14 +171,15 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Reserve SQLite's writer, or use a normal PostgreSQL transaction.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    PostgreSQL callers lock individual rows within this transaction instead.
     """
+
+    if engine.dialect.name != "sqlite":
+        with db_session() as session:
+            yield session
+        return
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
@@ -205,17 +200,28 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
+    candidates = list(
+        db.execute(
+            select(Attempt.id, Attempt.task_id)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
             .order_by(Attempt.lease_expires_at, Attempt.id)
         )
     )
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for attempt_id, task_id in candidates:
+        # All lifecycle mutations lock the task first. Re-read the attempt
+        # afterwards: a heartbeat or completion may have won the race.
+        task = db.scalar(select(Task).where(Task.id == task_id).with_for_update(skip_locked=True))
+        if task is None:
+            continue
+        attempt = db.scalar(
+            select(Attempt).where(Attempt.id == attempt_id).execution_options(populate_existing=True)
+        )
+        if (
+            attempt is None
+            or attempt.outcome != "processing"
+            or attempt.lease_expires_at > now_db
+        ):
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
