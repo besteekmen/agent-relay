@@ -1,0 +1,157 @@
+name: Test and deploy Agent Relay to local kind
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-relay-kind-deployment
+  cancel-in-progress: false
+
+# Run locally from WSL (do not use a containerized act runner):
+# act workflow_dispatch -W .github/workflows/ci.yml \
+#   -P self-hosted=-self-hosted \
+#   --env KUBECONFIG="$HOME/.kube/config" --env PATH="$PATH"
+# On GitHub, register a Linux self-hosted runner on the machine owning the
+# existing cluster. Required tools: Docker, kind, kubectl, uv, git, curl,
+# python3, flock, and Node.js (for actions/checkout).
+jobs:
+  test-build-deploy:
+    runs-on: self-hosted
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      KIND_CLUSTER: agent-relay
+      KUBE_CONTEXT: kind-agent-relay
+      KUBE_NAMESPACE: default
+      RELAY_TEST_BASE_URL: ""
+      RELAY_ENROLLMENT_SECRET: ""
+      ENROLLMENT_SECRET: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check tools and existing cluster
+        run: |
+          set -euo pipefail
+          for tool in docker kind kubectl uv git curl python3 flock; do
+            command -v "$tool"
+          done
+          docker info > /dev/null
+          kind get clusters | grep -Fx "$KIND_CLUSTER"
+          kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" get deployment/agent-relay-api deployment/postgres
+
+      - name: Allocate unique names and isolated test environment
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse --short=12 HEAD)
+          nonce=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+          run_key="relay-ci-${nonce}"
+          test_dir=$(mktemp -d)
+          {
+            echo "IMAGE_TAG=agent-relay:${revision}-${nonce}"
+            echo "CI_NETWORK=${run_key}"
+            echo "CI_POSTGRES=${run_key}-postgres"
+            echo "CI_API=${run_key}-api"
+            echo "CI_TEST_DIR=${test_dir}"
+            echo "UV_PROJECT_ENVIRONMENT=${test_dir}/venv"
+            echo "RELAY_DATABASE_URL=sqlite:///${test_dir}/tests.db"
+          } >> "$GITHUB_ENV"
+
+      - name: Install locked dependencies including tests
+        run: uv sync --frozen --python 3.11
+
+      - name: Run starter tests against isolated SQLite
+        run: uv run --frozen pytest -p no:cacheprovider -q
+
+      - name: Build uniquely tagged candidate image
+        run: docker build -t "$IMAGE_TAG" .
+
+      - name: Start isolated PostgreSQL and candidate API
+        run: |
+          set -euo pipefail
+          docker network create "$CI_NETWORK"
+          docker run -d --name "$CI_POSTGRES" \
+            --network "$CI_NETWORK" --network-alias postgres \
+            -e POSTGRES_USER=relay -e POSTGRES_PASSWORD=relay-ci \
+            -e POSTGRES_DB=relay_ci \
+            --health-cmd='pg_isready -U relay -d relay_ci' \
+            --health-interval=2s --health-timeout=3s --health-retries=60 \
+            postgres:17-bookworm
+          ready=false
+          for attempt in {1..60}; do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' "$CI_POSTGRES")" = healthy ]; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          [ "$ready" = true ] || { docker logs "$CI_POSTGRES"; exit 1; }
+          docker run -d --name "$CI_API" --network "$CI_NETWORK" \
+            -p 127.0.0.1::8000 \
+            -e RELAY_DATABASE_URL=postgresql+psycopg://relay:relay-ci@postgres:5432/relay_ci \
+            "$IMAGE_TAG"
+          port=$(docker inspect --format '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CI_API")
+          test_url="http://127.0.0.1:${port}"
+          echo "CI_API_URL=${test_url}" >> "$GITHUB_ENV"
+          ready=false
+          for attempt in {1..60}; do
+            if curl --fail --silent --max-time 3 "${test_url}/ready"; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          [ "$ready" = true ] || { docker logs "$CI_API"; exit 1; }
+
+      - name: Run existing acceptance test against PostgreSQL-backed API
+        run: |
+          RELAY_TEST_BASE_URL="$CI_API_URL" uv run --frozen pytest -p no:cacheprovider -q \
+            test_agent_relay.py::test_acceptance_scenario_1_sender_reads_completed_result
+
+      - name: Confirm acceptance result is stored in PostgreSQL
+        run: |
+          set -euo pipefail
+          count=$(docker exec "$CI_POSTGRES" psql -U relay -d relay_ci -Atc \
+            "SELECT count(*) FROM tasks WHERE idempotency_key = 'acceptance-1' AND status = 'completed' AND output = 'HELLO RELAY';")
+          [ "$count" = 1 ]
+
+      # This is the first step that changes anything in the existing cluster.
+      # Default success() gating skips it if ANY preceding step failed.
+      - name: Load tested image, update deployment, and wait for rollout
+        if: ${{ success() }}
+        run: |
+          set -euo pipefail
+          # act does not enforce every GitHub concurrency feature; also lock
+          # deployments locally so concurrent act runs cannot interleave them.
+          exec 9> /tmp/agent-relay-kind-deploy.lock
+          flock -w 600 9
+          kind load docker-image "$IMAGE_TAG" --name "$KIND_CLUSTER"
+          kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" rollout status deployment/postgres --timeout=180s
+          kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" set image deployment/agent-relay-api "api=$IMAGE_TAG"
+          kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" rollout status deployment/agent-relay-api --timeout=180s
+          actual=$(kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" get deployment/agent-relay-api -o 'jsonpath={.spec.template.spec.containers[?(@.name=="api")].image}')
+          [ "$actual" = "$IMAGE_TAG" ]
+
+      - name: Show diagnostic logs on failure
+        if: ${{ failure() }}
+        run: |
+          if [ -n "${CI_API:-}" ]; then docker logs "$CI_API" || true; fi
+          if [ -n "${CI_POSTGRES:-}" ]; then docker logs "$CI_POSTGRES" || true; fi
+          kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" get pods || true
+
+      - name: Clean up this run's test containers and scratch files
+        if: ${{ always() }}
+        run: |
+          if [ -n "${CI_API:-}" ]; then docker rm -fv "$CI_API" || true; fi
+          if [ -n "${CI_POSTGRES:-}" ]; then docker rm -fv "$CI_POSTGRES" || true; fi
+          if [ -n "${CI_NETWORK:-}" ]; then docker network rm "$CI_NETWORK" || true; fi
+          if [ -n "${CI_TEST_DIR:-}" ]; then rm -rf -- "$CI_TEST_DIR"; fi
